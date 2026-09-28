@@ -432,3 +432,89 @@ class TestSelectByIndexPanelStateIntegration:
             assert selector.select_by_index() is True
         warning_calls = [c for c in mock_logger.warning.call_args_list]
         assert not any("state=unknown" in str(c) for c in warning_calls)
+
+
+# ---------------------------------------------------------------------------
+# Tier card text-first matching (12:20 实战：缺货把 380 挤出可点击列表，
+# 纯索引兜底点错高价档)
+# ---------------------------------------------------------------------------
+
+
+class TestMatchPriceCardFromXml:
+    def _card(self, text, bounds="[0,0][100,50]"):
+        return (
+            f'<node class="android.widget.FrameLayout" clickable="true" bounds="{bounds}">'
+            f'<node class="android.widget.TextView" text="{text}"/></node>'
+        )
+
+    def _root(self, *cards):
+        import xml.etree.ElementTree as ET
+
+        return ET.fromstring(
+            "<node><node resource-id='cn.damai:id/project_detail_perform_price_flowlayout'>"
+            + "".join(cards)
+            + "</node></node>"
+        )
+
+    def _container_cards(self, root):
+        for node in root.iter("node"):
+            if (
+                node.get("resource-id")
+                == "cn.damai:id/project_detail_perform_price_flowlayout"
+            ):
+                return list(node)
+        return []
+
+    def _selector(self, price):
+        config = MagicMock()
+        config.price = price
+        config.price_index = 0
+        selector = PriceSelector(
+            device=MagicMock(), config=config, probe=MagicMock()
+        )
+        selector.set_bot(MagicMock())
+        return selector
+
+    def test_matches_configured_purchasable_card(self):
+        sel = self._selector("看台380元")
+        root = self._root(self._card("看台380元"), self._card("看台580元"))
+        cards = self._container_cards(root)
+        card = sel._match_price_card_from_xml(cards)
+        assert card is not None
+        assert "380" in sel._card_price_text(card)
+
+    def test_skips_sold_out_card_even_when_text_matches(self):
+        sel = self._selector("看台380元")
+        root = self._root(
+            self._card("看台380元 缺货登记"), self._card("看台980元")
+        )
+        cards = self._container_cards(root)
+        assert sel._match_price_card_from_xml(cards) is None
+
+    def test_get_coords_refuses_index_fallback_when_text_readable(self):
+        sel = self._selector("看台380元")
+        root = self._root(
+            self._card("看台380元 缺货登记", "[0,0][100,50]"),
+            self._card("看台980元", "[0,60][100,110]"),
+        )
+        sel._bot._dump_hierarchy_xml.return_value = root
+        assert sel._get_price_coords_from_xml() is None
+
+    def test_get_coords_keeps_index_fallback_when_text_unreadable(self):
+        sel = self._selector("看台380元")
+        root = self._root(
+            self._card("", "[0,0][100,50]"), self._card("", "[0,60][100,110]")
+        )
+        sel._bot._dump_hierarchy_xml.return_value = root
+        sel._bot._parse_bounds = lambda bounds: (0, 0, 100, 50)
+        assert sel._get_price_coords_from_xml() == (50, 25)
+
+    def test_get_coords_prefers_text_matched_card(self):
+        sel = self._selector("看台580元")
+        root = self._root(
+            self._card("看台380元", "[0,0][100,50]"),
+            self._card("看台580元", "[0,60][100,110]"),
+        )
+        sel._bot._dump_hierarchy_xml.return_value = root
+        sel._bot._parse_bounds = lambda bounds: (0, 60, 100, 110)
+        assert sel._get_price_coords_from_xml() == (50, 85)

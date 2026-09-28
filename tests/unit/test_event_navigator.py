@@ -866,3 +866,141 @@ class TestOpenTargetRejectedBlacklist:
         bot._current_page_matches_target.assert_called_once_with(
             {"state": "detail_page"}, clicked_title="张杰2026巡回演唱会北京站"
         )
+
+
+# ---------------------------------------------------------------------------
+# Search keyword submission (issue #61)
+# ---------------------------------------------------------------------------
+
+
+class TestTapKeywordSuggestion:
+    """键盘为自绘控件时 keycode 66 不触发搜索，联想行是主提交路径。"""
+
+    def _nav_with_bot(self):
+        config = MagicMock()
+        config.keyword = "张杰 演唱会"
+        nav = EventNavigator(device=MagicMock(), config=config, probe=MagicMock())
+        bot = MagicMock()
+        nav.set_bot(bot)
+        return nav, bot
+
+    def test_returns_true_and_clicks_when_suggestion_exists(self):
+        nav, bot = self._nav_with_bot()
+        selector = MagicMock()
+        bot._find.return_value = selector
+        bot._selector_exists.return_value = True
+
+        assert nav._tap_keyword_suggestion() is True
+        bot._click_element_center.assert_called_once_with(selector)
+
+    def test_returns_false_when_no_suggestion(self):
+        nav, bot = self._nav_with_bot()
+        bot._selector_exists.return_value = False
+
+        assert nav._tap_keyword_suggestion() is False
+        bot._click_element_center.assert_not_called()
+
+    def test_returns_false_when_click_raises(self):
+        nav, bot = self._nav_with_bot()
+        bot._selector_exists.return_value = True
+        bot._click_element_center.side_effect = Exception("stale element")
+
+        assert nav._tap_keyword_suggestion() is False
+
+    def test_submit_prefers_suggestion_over_enter(self):
+        nav, bot = self._nav_with_bot()
+        bot._read_element_text.return_value = "张杰 演唱会"
+
+        with patch.object(nav, "_tap_keyword_suggestion", return_value=True):
+            assert nav._submit_search_keyword() is True
+        bot._press_keycode_safe.assert_not_called()
+
+    def test_submit_falls_back_to_enter_when_no_suggestion(self):
+        nav, bot = self._nav_with_bot()
+        bot._read_element_text.return_value = "张杰 演唱会"
+        bot._has_element.return_value = False
+        bot._find_all.return_value = [MagicMock()]
+
+        with patch.object(nav, "_tap_keyword_suggestion", return_value=False):
+            assert nav._submit_search_keyword() is True
+        bot._press_keycode_safe.assert_called_once()
+
+    def test_submit_reports_movie_results_hint_on_timeout(self):
+        """结果加载超时且存在电影购票卡时，提示 keyword 指向了影视内容。"""
+        nav, bot = self._nav_with_bot()
+        bot._read_element_text.return_value = "张杰 演唱会"
+        bot._has_element.side_effect = lambda by, value: (
+            "film_card_buy_btn" in str(value)
+        )
+        bot._find_all.return_value = []
+        fake_time = MagicMock(side_effect=[0.0, 100.0])
+
+        with patch.object(nav, "_tap_keyword_suggestion", return_value=True):
+            with patch("mobile.event_navigator.time") as fake_t:
+                fake_t.time = fake_time
+                fake_t.sleep = MagicMock()
+                assert nav._submit_search_keyword() is False
+        bot._press_keycode_safe.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tour station picking (issue #61 — 巡演聚合卡)
+# ---------------------------------------------------------------------------
+
+
+class TestTourStationCandidate:
+    """巡演聚合卡按配置城市选站，城市不匹配时绝不点击。"""
+
+    def _nav_with_bot(self, city):
+        config = MagicMock()
+        config.keyword = "谢霆锋进化演唱会"
+        config.city = city
+        nav = EventNavigator(device=MagicMock(), config=config, probe=MagicMock())
+        bot = MagicMock()
+        nav.set_bot(bot)
+        return nav, bot
+
+    def _stub_tour(self, bot, cities):
+        tour_card = MagicMock()
+        city_nodes = [MagicMock() for _ in cities]
+        bot._find_all.side_effect = lambda by, value: (
+            [tour_card] if "ll_search_item" in str(value) else city_nodes
+        )
+        bot._safe_element_text.return_value = "EvolutionNicLive谢霆锋进化演唱会"
+        bot._read_element_text.side_effect = cities
+        return city_nodes
+
+    def test_returns_station_node_when_city_matches(self):
+        nav, bot = self._nav_with_bot("杭州")
+        city_nodes = self._stub_tour(bot, ["温州", "杭州", "福州"])
+
+        node, title = nav._find_tour_station_candidate([MagicMock()])
+        assert node is city_nodes[1]
+        assert title == "EvolutionNicLive谢霆锋进化演唱会"
+        bot._click_element_center.assert_not_called()
+
+    def test_matches_city_with_station_suffix(self):
+        """配置“杭州市/杭州站”等写法也应命中。"""
+        nav, bot = self._nav_with_bot("杭州市")
+        city_nodes = self._stub_tour(bot, ["温州", "杭州"])
+
+        node, _ = nav._find_tour_station_candidate([MagicMock()])
+        assert node is city_nodes[1]
+
+    def test_returns_none_without_click_when_city_missing(self, caplog):
+        nav, bot = self._nav_with_bot("北京")
+        self._stub_tour(bot, ["温州", "杭州", "福州"])
+
+        node, title = nav._find_tour_station_candidate([MagicMock()])
+        assert node is None
+        assert "EvolutionNicLive" in title
+        bot._click_element_center.assert_not_called()
+
+    def test_returns_none_when_no_tour_card(self):
+        nav, bot = self._nav_with_bot("杭州")
+        bot._find_all.return_value = []
+        bot._safe_element_text.return_value = ""
+
+        node, title = nav._find_tour_station_candidate([MagicMock()])
+        assert node is None
+        assert title is None

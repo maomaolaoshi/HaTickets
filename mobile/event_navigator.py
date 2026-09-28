@@ -572,8 +572,11 @@ class EventNavigator:
                 except Exception:
                     return False
 
-            if not bot._press_keycode_safe(66, context="提交搜索关键词"):
-                return False
+            # 华为/百度等输入法上 keycode 66 不触发搜索（issue #61 真机验证）：
+            # 优先点击搜索框下方的关键词联想行，失败再回退 ENTER。
+            if not self._tap_keyword_suggestion():
+                if not bot._press_keycode_safe(66, context="提交搜索关键词"):
+                    return False
             if bot._has_element(ANDROID_UIAUTOMATOR, 'new UiSelector().text("演出")'):
                 bot.smart_wait_and_click(
                     ANDROID_UIAUTOMATOR,
@@ -590,10 +593,35 @@ class EventNavigator:
                 else:
                     raise TimeoutException("搜索结果加载超时")
             except TimeoutException:
-                logger.warning("搜索结果加载超时")
+                if bot._has_element(By.ID, "cn.damai:id/search_result_film_card_buy_btn"):
+                    logger.warning(
+                        "搜索结果为电影/影视内容，自动购票仅支持演出类结果，请检查 keyword"
+                    )
+                else:
+                    logger.warning("搜索结果加载超时")
                 return False
 
         return True
+
+    def _tap_keyword_suggestion(self):
+        """点击搜索框下方的关键词联想行以提交搜索（issue #61）。
+
+        9.x 版本搜索编辑页在输入关键词后会出现以 ``tv_word`` 展示的联想行，
+        点击它等效于提交搜索；键盘为自绘控件时 ENTER 不生效，此路是主路径。
+        resource-id 查找必须走 By.ID 通道（u2 无法解析 UiSelector 字符串中的
+        ``resourceId()``，真机验证）。
+        """
+        bot = self._bot
+        try:
+            selector = bot._find(By.ID, "cn.damai:id/tv_word")
+            if not bot._selector_exists(selector):
+                return False
+            bot._click_element_center(selector)
+            logger.info("已点击关键词联想行提交搜索")
+            return True
+        except Exception as e:
+            logger.warning(f"点击关键词联想行失败，回退 ENTER 提交: {e}")
+            return False
 
     def _score_search_result(self, title_text, venue_text, city_text=None):
         """Score a search result against the configured target.
@@ -706,6 +734,46 @@ class EventNavigator:
             return
         bot.d.swipe(540, 1770, 540, 520, duration=0.3)
 
+    def _find_tour_station_candidate(self, result_cards):
+        """在巡演聚合卡场景下找与配置城市匹配的站点行（issue #61）。
+
+        巡演卡以 ``tv_project_tourName`` 标识（如"谢霆锋进化演唱会，以下4个城市
+        巡演中"），站点行 ``tv_city`` 展开在卡外同屏容器中，需点击站点行才能
+        进入城市场次的详情页。返回 ``(站点节点, 巡演标题)``；无巡演卡返回
+        ``(None, None)``；有巡演卡但城市不匹配时返回 ``(None, 巡演标题)`` 并
+        列出可用站点——绝不能点击错误城市，那是另一场演出。
+        """
+        bot = self._bot
+        tour_title = None
+        for card in result_cards:
+            name = bot._safe_element_text(
+                card, By.ID, "cn.damai:id/tv_project_tourName"
+            )
+            if name:
+                tour_title = name
+                break
+        if tour_title is None:
+            return None, None
+
+        wanted = normalize_text((self._config.city or "").strip())
+        available = []
+        for node in bot._find_all(By.ID, "cn.damai:id/tv_city"):
+            city_text = bot._read_element_text(node).strip()
+            if not city_text:
+                continue
+            available.append(city_text)
+            normalized_city = normalize_text(city_text.replace("站", "").strip())
+            if wanted and (wanted in normalized_city or normalized_city in wanted):
+                logger.info("巡演卡命中目标城市 %s，点击站点行", city_text)
+                return node, tour_title
+        logger.warning(
+            "巡演卡《%s》未找到匹配城市 %s，可用站点: %s",
+            tour_title,
+            self._config.city or "(未配置)",
+            "/".join(dict.fromkeys(available)) or "未知",
+        )
+        return None, tour_title
+
     def _open_target_from_search_results(
         self, max_scrolls=2, max_results=5, return_details=False
     ):
@@ -773,8 +841,18 @@ class EventNavigator:
                         best_match = card
                         best_title = title_text
 
+                click_node, click_title = None, None
                 if best_match is not None and best_score >= _CLICK_SCORE_THRESHOLD:
-                    bot._click_element_center(best_match)
+                    click_node, click_title = best_match, best_title
+                if click_node is None:
+                    tour_node, tour_title = self._find_tour_station_candidate(
+                        result_cards
+                    )
+                    if tour_node is not None:
+                        click_node, click_title = tour_node, tour_title
+
+                if click_node is not None:
+                    bot._click_element_center(click_node)
                     detail_probe = bot.wait_for_page_state(
                         {"detail_page", "sku_page"}, timeout=5.5
                     )
@@ -782,7 +860,7 @@ class EventNavigator:
                         "detail_page",
                         "sku_page",
                     } and bot._current_page_matches_target(
-                        detail_probe, clicked_title=best_title
+                        detail_probe, clicked_title=click_title
                     ):
                         collected.sort(key=lambda item: item["score"], reverse=True)
                         details = {
@@ -794,7 +872,7 @@ class EventNavigator:
                     logger.warning(
                         "已进入详情页，但标题与目标演出不一致，返回搜索结果继续尝试"
                     )
-                    rejected_titles.add(normalize_text(best_title))
+                    rejected_titles.add(normalize_text(click_title))
                     if not bot._press_keycode_safe(4, context="返回搜索列表"):
                         break
                     time.sleep(0.25)

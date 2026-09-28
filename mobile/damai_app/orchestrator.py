@@ -856,17 +856,17 @@ class DamaiBot(
                 if self.config.rush_mode and not self.config.if_commit_order:
                     logger.info("开发验证极速路径：已在票档页，跳过场次切换")
                 else:
-                    self.select_performance_date(
-                        timeout=0.35 if self.config.rush_mode else 1.0
+                    self._ensure_performance_date_selected(
+                        max_wait=2.0 if self.config.rush_mode else 3.0
                     )
-                if self.config.rush_mode:
-                    # 极速模式下避免一次完整重探测，减少热路径阻塞。
-                    page_probe = dict(page_probe)
-                    page_probe.setdefault("state", "sku_page")
-                    if "reservation_mode" not in page_probe:
-                        page_probe["reservation_mode"] = self.is_reservation_sku_mode()
-                else:
-                    page_probe = self.probe_current_page()
+            if self.config.rush_mode:
+                # 极速模式下避免一次完整重探测，减少热路径阻塞。
+                page_probe = dict(page_probe)
+                page_probe.setdefault("state", "sku_page")
+                if "reservation_mode" not in page_probe:
+                    page_probe["reservation_mode"] = self.is_reservation_sku_mode()
+            else:
+                page_probe = self.probe_current_page()
 
             # 多场次活动：识别 SESSION_PICKER 后强制选场，避免抢错场次（issue #25）。
             if page_probe["state"] == PageState.SESSION_PICKER.value:
@@ -940,27 +940,13 @@ class DamaiBot(
 
             # 4. 数量选择
             logger.info("选择数量...")
-            if len(self.config.users) > 1 and self._has_element(By.ID, "layout_num"):
-                clicks_needed = len(self.config.users) - 1
-                if clicks_needed > 0:
-                    try:
-                        plus_button = self._find(By.ID, "img_jia")
-                        for i in range(clicks_needed):
-                            rect = self._element_rect(plus_button)
-                            x = rect["x"] + rect["width"] // 2
-                            y = rect["y"] + rect["height"] // 2
-                            self._click_coordinates(x, y, duration=50)
-                            time.sleep(0.02)
-                    except Exception as e:
-                        logger.error(f"快速点击加号失败: {e}")
-
-            # if self.driver.find_elements(by=By.ID, value='layout_num') and self.config.users is not None:
-            #     for i in range(len(self.config.users) - 1):
-            #         self.driver.find_element(by=By.ID, value='img_jia').click()
+            if len(self.config.users) > 1:
+                self._adjust_quantity_to_user_count()
 
             # 5. 确定购买 — brief wait for price selection to register.
             # Damai App ignores confirm clicks until btn_buy_view becomes clickable (price > 0).
-            time.sleep(0.5)
+            # 极速模式确认循环自带 2 连击 + 4s 重试窗口，首击落空有兜底，只需短暂让面板登记票档。
+            time.sleep(0.1 if self.config.rush_mode else 0.5)
             logger.info("确定购买...")
             submit_ready = False
             confirm_deadline = time.time() + (4.0 if self.config.rush_mode else 1.8)
@@ -1108,6 +1094,115 @@ class DamaiBot(
             return False
         finally:
             time.sleep(0.05)
+
+    # 数量文本的候选 resource-id：不同大麦版本命名不一致（issue #62）。
+    _QUANTITY_TEXT_RIDS = frozenset({"text_num", "tv_num", "number"})
+
+    # 票数是个位/十位数；用于把数量文本与价格等大数值区分开。
+    _MAX_TICKET_QUANTITY = 20
+
+    def _read_current_quantity(self, xml_root=None):
+        """读取 SKU 页数量选择器当前值；读不到返回 None（issue #62）。
+
+        预约抢票的 SKU 页会按预约观演人数预置票数，不能假设初始为 1。
+        T-0 每次设备往返都值钱：单次 hierarchy dump 内完成 layout_num 定位、
+        候选 id 匹配与纯数字兜底，不做逐候选的 selector 轮询。
+        """
+        root = xml_root or self._dump_hierarchy_xml()
+        if root is None:
+            return None
+        for node in root.iter("node"):
+            if node.get("resource-id", "").endswith("/layout_num"):
+                break
+        else:
+            return None
+        subtree = []
+        for sub in node.iter("node"):
+            value = (sub.get("text") or "").strip()
+            if value:
+                rid = sub.get("resource-id", "").split("/")[-1]
+                subtree.append((rid, value))
+        for rid, value in subtree:
+            if rid in self._QUANTITY_TEXT_RIDS and value.isdigit():
+                return int(value)
+        for _, value in subtree:
+            # 数量是个位/十位数；排除价格等大数值误读
+            if len(value) <= 2 and value.isdigit() and 1 <= int(value) <= self._MAX_TICKET_QUANTITY:
+                return int(value)
+        return None
+
+    def _click_quantity_button(self, resource_id, clicks):
+        """连续点击数量 +/－ 按钮；任一次失败返回 False 由调用方兜底。"""
+        try:
+            button = self._find(By.ID, resource_id)
+            for _ in range(clicks):
+                rect = self._element_rect(button)
+                x = rect["x"] + rect["width"] // 2
+                y = rect["y"] + rect["height"] // 2
+                self._click_coordinates(x, y, duration=50)
+                time.sleep(0.02)
+            return True
+        except Exception as e:
+            logger.error(f"点击数量按钮 {resource_id} 失败: {e}")
+            return False
+
+    def _adjust_quantity_to_user_count(self):
+        """把票数对齐到观演人数（issue #62：预约抢票页会预置票数，盲加会超买）。"""
+        target = len(self.config.users)
+        root = self._dump_hierarchy_xml()
+        if root is None:
+            logger.warning("无法获取页面结构，跳过数量调整")
+            return
+        if not any(
+            node.get("resource-id", "").endswith("/layout_num")
+            for node in root.iter("node")
+        ):
+            logger.info("面板无数量选择器（选座/缺货登记等流程），跳过数量调整")
+            return
+        current = self._read_current_quantity(xml_root=root)
+        if current is None:
+            # 读不到当前票数时绝不盲点（#62 练手复现：面板被预约偏好预置 2 张，
+            # 按"默认 1 张"盲加变成 3 张）。数量维持面板现状，对不上由确认页
+            # 的人数校验兜底中止。
+            logger.error(
+                "无法读取当前票数，跳过数量调整（期望 %d 张）；确认页人数不符将中止提交",
+                target,
+            )
+            return
+        diff = target - current
+        if diff == 0:
+            logger.info("当前票数已是 %d 张，无需调整", target)
+            return
+        if diff > 0:
+            self._click_quantity_button("img_jia", diff)
+            return
+        if not self._click_quantity_button("img_jian", -diff):
+            logger.error(
+                "当前票数 %d 张超过目标 %d 张且未找到减号按钮，请立即人工核对票数",
+                current,
+                target,
+            )
+
+    def _ensure_performance_date_selected(self, max_wait=3.0):
+        """确保目标场次日期被点上（12:20 实战：面板刚展开时日期卡片尚未渲染，
+        单次点击落空后直接进票档步骤，整轮作废）。按 0.3s 点击 + 0.1s 间隔
+        重试至 max_wait；面板始终无该日期卡片（单场次或配置不符）时放行，
+        按默认场次继续。
+        """
+        if not self.config.date:
+            return
+        date_selector = f'new UiSelector().textContains("{self.config.date}")'
+        attempts = max(1, int(max_wait / 0.4))
+        for attempt in range(1, attempts + 1):
+            if self.ultra_fast_click(ANDROID_UIAUTOMATOR, date_selector, timeout=0.3):
+                logger.info("选择场次日期: %s (attempt=%d)", self.config.date, attempt)
+                return
+            time.sleep(0.1)
+        logger.warning(
+            "%.1fs 内未出现日期 '%s' 卡片，按面板默认场次继续",
+            attempts * 0.4,
+            self.config.date,
+        )
 
     def run_with_retry(self, max_retries=3, initial_page_probe=None):
         """带重试机制的抢票"""

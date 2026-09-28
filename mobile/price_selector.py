@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -334,6 +335,10 @@ class PriceSelector:
 
         Searches multiple container IDs to handle both detail-page and SKU-page layouts.
         Returns (x, y) tuple or None.
+
+        卡片优先按配置文本匹配（且不带缺货标签）；文本匹配不到但卡片文本可读时
+        不做索引兜底——库存秒变“缺货登记”会把 380 挤出可点击列表，纯索引会点到
+        错误的高价档（12:20 实战教训）。
         """
         bot = self._bot
         if xml_root is None:
@@ -356,6 +361,19 @@ class PriceSelector:
                     ]
                     if not cards:
                         continue
+                    matched = self._match_price_card_from_xml(cards)
+                    if matched is not None:
+                        bounds = bot._parse_bounds(matched.get("bounds", ""))
+                        if bounds:
+                            left, top, right, bottom = bounds
+                            return ((left + right) // 2, (top + bottom) // 2)
+                        continue
+                    if self._price_cards_text_readable(cards):
+                        logger.warning(
+                            "票档文本与配置 %r 不匹配或已缺货，放弃索引兜底以防买错档",
+                            self._config.price,
+                        )
+                        continue
                     if not (0 <= self._config.price_index < len(cards)):
                         logger.debug(
                             f"price_index={self._config.price_index} 超出 {container_id} "
@@ -369,6 +387,32 @@ class PriceSelector:
                         left, top, right, bottom = bounds
                         return ((left + right) // 2, (top + bottom) // 2)
         return None
+
+    def _card_price_text(self, card):
+        """Concatenate a tier card's visible texts (text attrs + content-desc)."""
+        parts = []
+        for sub in card.iter("node"):
+            for attr in ("text", "content-desc"):
+                value = (sub.get(attr) or "").strip()
+                if value:
+                    parts.append(value)
+        return " ".join(parts)
+
+    def _match_price_card_from_xml(self, cards):
+        """Return the card matching the configured price and free of sold-out tags."""
+        for card in cards:
+            text = self._card_price_text(card)
+            if not text:
+                continue
+            if any(tag in text for tag in _PRICE_UNAVAILABLE_TAGS):
+                continue
+            if self._price_text_matches_target(text):
+                return card
+        return None
+
+    def _price_cards_text_readable(self, cards):
+        """Whether any tier card exposes readable text (else index fallback is safe)."""
+        return any(self._card_price_text(card) for card in cards)
 
     def _extract_price_digits(self, text):
         """Extract the numeric portion of a ticket price label."""
@@ -669,9 +713,44 @@ class PriceSelector:
                 )
                 clickable_cards = [card for card in cards if bot._is_clickable(card)]
                 if not (0 <= self._config.price_index < len(clickable_cards)):
-                    logger.warning(
-                        f"price_index={self._config.price_index} 超出可点击卡片数量 {len(clickable_cards)}"
+                    # 票档面板可能尚未渲染完成（issue #61 的 0 卡片失败）：
+                    # 短暂等待后重查一次，再失败则给出可行动的诊断信息。
+                    time.sleep(0.6)
+                    cards = bot._container_find_elements(
+                        price_container, By.CLASS_NAME, "android.widget.FrameLayout"
                     )
+                    clickable_cards = [card for card in cards if bot._is_clickable(card)]
+                if not (0 <= self._config.price_index < len(clickable_cards)):
+                    if not clickable_cards:
+                        hint_marks = (
+                            "去选座",
+                            "每次限",
+                            "缺货登记",
+                            "选座购买",
+                            "预约想看",
+                        )
+                        hints = [
+                            text
+                            for text in hint_marks
+                            if bot._has_element(
+                                ANDROID_UIAUTOMATOR,
+                                f'new UiSelector().textContains("{text}")',
+                            )
+                        ]
+                        if hints:
+                            logger.error(
+                                "票档容器内无可点击卡片：当前为 %s 流程，标准票档选择不适用",
+                                "/".join(hints),
+                            )
+                        else:
+                            logger.error(
+                                "票档容器内无可点击卡片（price_index=%s），票档面板可能未加载完成",
+                                self._config.price_index,
+                            )
+                    else:
+                        logger.warning(
+                            f"price_index={self._config.price_index} 超出可点击卡片数量 {len(clickable_cards)}"
+                        )
                     return False
                 target_price = clickable_cards[self._config.price_index]
             bot._click_element_center(target_price, duration=30)

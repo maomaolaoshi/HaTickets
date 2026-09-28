@@ -1234,10 +1234,11 @@ class TestRunTicketGrabbing:
 
         assert result is False
         assert fast_click.call_count == 1
+        # _ensure_performance_date_selected：场次卡片每 0.3s 尝试一次（issue #61 实战）
         fast_click.assert_called_once_with(
             ANDROID_UIAUTOMATOR,
             'new UiSelector().textContains("12.06")',
-            timeout=1.0,
+            timeout=0.3,
         )
         assert "抢票预约" in caplog.text
 
@@ -5712,3 +5713,146 @@ class TestAttemptsMade:
                 with patch.object(bot, "_setup_driver"):
                     with patch("mobile.damai_app.time"):
                         assert bot.run_with_retry(max_retries=2) is False
+
+
+# ---------------------------------------------------------------------------
+# Quantity adjustment (issue #62)
+# ---------------------------------------------------------------------------
+
+
+class TestQuantityAdjustment:
+    """SKU 页数量先读后调：预约抢票会预置票数，禁止按“默认 1 张”盲加。"""
+
+    def _dump_with_qty(self, layout_num=True, texts=("2",), rid="text_num"):
+        import xml.etree.ElementTree as ET
+
+        qty = ""
+        if layout_num:
+            inner = "".join(
+                f'<node class="android.widget.TextView" '
+                f'resource-id="cn.damai:id/{rid}" text="{t}"/>'
+                for t in texts
+            )
+            qty = (
+                '<node class="android.widget.LinearLayout" '
+                'resource-id="cn.damai:id/layout_num">' + inner + "</node>"
+            )
+        return ET.fromstring(
+            "<node><node resource-id='cn.damai:id/price_area'>"
+            '<node resource-id="cn.damai:id/tv_price" text="¥380"/>'
+            + qty
+            + "</node></node>"
+        )
+
+    def _stub_dump(self, bot, **kwargs):
+        bot._dump_hierarchy_xml = Mock(return_value=self._dump_with_qty(**kwargs))
+
+    def test_read_current_quantity_prefers_known_text_id(self, bot):
+        self._stub_dump(bot, texts=("2",))
+        assert bot._read_current_quantity() == 2
+
+    def test_read_current_quantity_falls_back_to_digit_scan(self, bot):
+        """候选 resource-id 全部未命中时，容器内纯数字文本兜底。"""
+        self._stub_dump(bot, rid="tv_unknown", texts=("2",))
+        assert bot._read_current_quantity() == 2
+
+    def test_read_current_quantity_ignores_price_like_digits(self, bot):
+        """价格（580）与限购提示（非纯数字）不得误读为票数。"""
+        self._stub_dump(bot, rid="tv_unknown", texts=("580", "限购4张"))
+        assert bot._read_current_quantity() is None
+
+    def test_read_current_quantity_ignores_digits_outside_layout_num(self, bot):
+        """layout_num 之外的价格数字不得参与兜底扫描。"""
+        self._stub_dump(bot, layout_num=False)
+        assert bot._read_current_quantity() is None
+
+    def test_adjust_quantity_no_clicks_when_preset_matches_users(self, bot):
+        """预约抢票预置 2 张、配置 2 位观演人 → 零点击（issue #62 主场景）。"""
+        self._stub_dump(bot)
+        with patch.object(bot, "_read_current_quantity", return_value=2):
+            with patch.object(bot, "_click_quantity_button") as click_btn:
+                bot._adjust_quantity_to_user_count()
+        click_btn.assert_not_called()
+
+    def test_adjust_quantity_clicks_plus_from_default_one(self, bot):
+        """普通购票默认 1 张、目标 2 张 → 加号点 1 次。"""
+        self._stub_dump(bot)
+        with patch.object(bot, "_read_current_quantity", return_value=1):
+            with patch.object(bot, "_click_quantity_button", return_value=True) as btn:
+                bot._adjust_quantity_to_user_count()
+        btn.assert_called_once_with("img_jia", 1)
+
+    def test_adjust_quantity_reduces_with_minus_when_over(self, bot):
+        """当前 3 张超过目标 2 张 → 用减号纠正，避免超买。"""
+        self._stub_dump(bot)
+        with patch.object(bot, "_read_current_quantity", return_value=3):
+            with patch.object(bot, "_click_quantity_button", return_value=True) as btn:
+                bot._adjust_quantity_to_user_count()
+        btn.assert_called_once_with("img_jian", 1)
+
+    def test_adjust_quantity_warns_when_minus_missing(self, bot, caplog):
+        """减号不可用时不得崩溃，且必须大声提示人工核对。"""
+        self._stub_dump(bot)
+        with patch.object(bot, "_read_current_quantity", return_value=3):
+            with patch.object(bot, "_click_quantity_button", return_value=False):
+                bot._adjust_quantity_to_user_count()
+        assert "超过" in caplog.text
+
+    def test_adjust_quantity_skips_when_unreadable(self, bot):
+        """读不到当前数量时绝不盲点（#62 练手复现：预置 2 张被盲加成 3 张）。"""
+        self._stub_dump(bot)
+        with patch.object(bot, "_read_current_quantity", return_value=None):
+            with patch.object(bot, "_click_quantity_button") as btn:
+                bot._adjust_quantity_to_user_count()
+        btn.assert_not_called()
+
+    def test_adjust_quantity_skips_when_no_quantity_picker(self, bot):
+        """选座/缺货登记等无数量选择器的面板直接跳过，不报错。"""
+        self._stub_dump(bot, layout_num=False)
+        with patch.object(bot, "_read_current_quantity") as read_qty:
+            with patch.object(bot, "_click_quantity_button") as btn:
+                bot._adjust_quantity_to_user_count()
+        read_qty.assert_not_called()
+        btn.assert_not_called()
+
+    def test_click_quantity_button_taps_center_per_click(self, bot):
+        button = Mock()
+        with patch.object(bot, "_find", return_value=button):
+            with patch.object(
+                bot,
+                "_element_rect",
+                return_value={"x": 10, "y": 20, "width": 50, "height": 40},
+            ):
+                with patch.object(bot, "_click_coordinates") as click_xy:
+                    with patch("mobile.damai_app.time.sleep"):
+                        assert bot._click_quantity_button("img_jia", 2) is True
+        assert click_xy.call_count == 2
+        click_xy.assert_called_with(35, 40, duration=50)
+
+    def test_click_quantity_button_returns_false_on_error(self, bot):
+        with patch.object(bot, "_find", side_effect=Exception("gone")):
+            assert bot._click_quantity_button("img_jia", 1) is False
+
+
+# ---------------------------------------------------------------------------
+# Session date ensure (12:20 实战：面板刚展开日期卡片未渲染，单次落空整轮作废)
+# ---------------------------------------------------------------------------
+
+
+class TestEnsurePerformanceDateSelected:
+    def test_clicks_until_success(self, bot):
+        with patch.object(bot, "ultra_fast_click", side_effect=[False, True]) as click:
+            with patch("mobile.damai_app.time.sleep"):
+                bot._ensure_performance_date_selected(max_wait=3.0)
+        assert click.call_count == 2
+
+    def test_gives_up_after_max_attempts_without_crash(self, bot):
+        with patch.object(bot, "ultra_fast_click", return_value=False):
+            with patch("mobile.damai_app.time.sleep"):
+                bot._ensure_performance_date_selected(max_wait=3.0)
+
+    def test_no_date_configured_returns_immediately(self, bot):
+        bot.config.date = ""
+        with patch.object(bot, "ultra_fast_click") as click:
+            bot._ensure_performance_date_selected()
+        click.assert_not_called()

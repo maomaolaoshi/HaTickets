@@ -301,12 +301,16 @@ class TestU2SearchHotPath:
     def test_open_target_from_search_results_returns_details_when_not_opened(self):
         bot = DamaiBot(config=_u2_config(), setup_driver=False)
         card = Mock()
+        card_texts = ["相关演出", "未知场馆", "北京", "04.06"]
+
+        def _fake_safe_text(element, by, value):
+            # 巡演聚合卡探测（issue #61）：tv_project_tourName 探测返回空
+            if "tourName" in str(value):
+                return ""
+            return card_texts.pop(0)
+
         with patch.object(bot, "_find_all", return_value=[card]), \
-             patch.object(
-                 bot,
-                 "_safe_element_text",
-                 side_effect=["相关演出", "未知场馆", "北京", "04.06"],
-             ), \
+             patch.object(bot, "_safe_element_text", side_effect=_fake_safe_text), \
              patch.object(bot, "_score_search_result", return_value=10):
             result = bot._open_target_from_search_results(max_scrolls=0, return_details=True)
 

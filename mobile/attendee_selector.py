@@ -236,6 +236,21 @@ class AttendeeSelector:
         if self._config.rush_mode:
             if not checkbox_elements:
                 return not require_attendee_section
+            # 页面“仅需选择N位”与配置观演人数不一致 = 票数错配（issue #62
+            # 练手复现：票数被预置改动后确认页要求 3 位而配置只有 2 位），
+            # 此时提交必然失败或买错数量，直接中止（fail-closed）。
+            page_required = self._bot._attendee_required_count_on_confirm_page()
+            configured_count = len(self._config.users or [])
+            if (
+                isinstance(page_required, int)
+                and page_required != configured_count
+            ):
+                logger.error(
+                    "确认页要求 %d 位观演人，与配置 %d 位不一致（票数可能被预置改动），中止提交",
+                    page_required,
+                    configured_count,
+                )
+                return False
         else:
             attendee_section_visible = bot._has_element(
                 ANDROID_UIAUTOMATOR,

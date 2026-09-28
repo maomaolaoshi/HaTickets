@@ -39,7 +39,7 @@ htmlcov/
 
 # Real config files (use *.example as template)
 mobile/config.jsonc
-mobile/config.local.jsonc
+mobile/config.local*.jsonc
 
 # U-06: 配置写回产生的备份与 sidecar 锁文件
 mobile/*.jsonc.bak
